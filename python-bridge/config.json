@@ -1,0 +1,5 @@
+{
+    "com_port": "COM5",
+    "baud_rate": 9600,
+    "api_url": "http://localhost:8000/api/update-room"
+}
