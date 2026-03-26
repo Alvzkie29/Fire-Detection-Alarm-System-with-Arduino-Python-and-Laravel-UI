@@ -2,224 +2,293 @@ import serial
 import requests
 import json
 import time
-import re
+import threading
+import os
+from datetime import datetime
 
-# Load configuration
+# ======== Load Config ========
 try:
     with open("config.json", "r") as f:
         config = json.load(f)
 except FileNotFoundError:
-    print("❌ Error: config.json not found!")
+    print("ERROR: config.json not found!")
     exit(1)
 except json.JSONDecodeError:
-    print("❌ Error: config.json is not valid JSON!")
+    print("ERROR: config.json is not valid JSON!")
     exit(1)
 
+COM_PORT  = config.get("com_port",  "/dev/ttyUSB0")
+BAUD_RATE = config.get("baud_rate", 9600)
+API_URL   = config.get("api_url",   "http://localhost:8000/api/update-room")
+
 print("=" * 60)
-print("🔥 FIRE DETECTION SYSTEM - ARDUINO TO LARAVEL BRIDGE")
+print("FIRE DETECTION SYSTEM - PYTHON BRIDGE")
 print("=" * 60)
-print(f"📡 COM Port: {config.get('com_port', 'COM5')}")
-print(f"⚡ Baud Rate: {config.get('baud_rate', 9600)}")
-print(f"🌐 API URL: {config.get('api_url', 'http://localhost:8000/api/update-room')}")
+print(f"COM Port : {COM_PORT}")
+print(f"Baud Rate: {BAUD_RATE}")
+print(f"API URL  : {API_URL}")
 print("=" * 60)
+
+# ======== Check if port exists ========
+if not os.path.exists(COM_PORT):
+    print(f"ERROR: Port {COM_PORT} does not exist!")
+    print("Available ports:")
+    os.system("ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null")
+    exit(1)
 
 # ======== Connect to Arduino ========
 try:
-    arduino = serial.Serial(config["com_port"], config["baud_rate"], timeout=1)
-    time.sleep(2)  # Wait for Arduino to initialize
-    print(f"✅ Connected to Arduino on {config['com_port']} at {config['baud_rate']} baud")
+    print(f"Connecting to {COM_PORT} at {BAUD_RATE} baud...")
+    arduino = serial.Serial(
+        port=COM_PORT,
+        baudrate=BAUD_RATE,
+        timeout=2,
+        bytesize=serial.EIGHTBITS,
+        parity=serial.PARITY_NONE,
+        stopbits=serial.STOPBITS_ONE
+    )
+    
+    arduino.reset_input_buffer()
+    arduino.reset_output_buffer()
+    
+    time.sleep(2)
+    print(f"Connected to Arduino on {COM_PORT}")
+    
 except serial.SerialException as e:
-    print(f"❌ Error: Could not connect to {config['com_port']}")
-    print(f"   Details: {e}")
-    print("\n💡 Troubleshooting tips:")
-    print("   1. Check if Arduino is connected")
-    print("   2. Check COM port in Device Manager")
-    print("   3. Close Arduino IDE Serial Monitor")
+    print(f"ERROR: Could not connect to {COM_PORT}")
+    print(f"Details: {e}")
+    print("\nTroubleshooting steps:")
+    print("1. Check if Arduino is plugged in")
+    print("2. Run: sudo chmod 666 " + COM_PORT)
+    print("3. Run: sudo usermod -a -G dialout $USER")
+    print("4. Log out and back in")
     exit(1)
 
-# ======== Track last known states ========
-last_states = {
-    "ROOM1": "SAFE",
-    "ROOM2": "SAFE",
-    "ROOM3": "SAFE"
+# ======== Thresholds ========
+TEMP_HIGH = 50.0
+TEMP_LOW  = 45.0
+GAS_HIGH  = 700
+GAS_LOW   = 600
+
+# ======== State Tracking ========
+class RoomState:
+    def __init__(self, room_type):
+        self.status = "SAFE"
+        self.reading = "--"
+        self.last_status = "SAFE"
+        self.last_reading = "--"
+        self.last_sent_time = 0
+        self.room_type = room_type
+    
+    def should_send(self, new_status, new_reading):
+        current_time = time.time()
+        
+        if new_status != self.last_status:
+            return True
+        
+        if new_status == "FIRE":
+            if current_time - self.last_sent_time >= 0.3:
+                return True
+        else:
+            if self.room_type == "temp" and isinstance(new_reading, (int, float)):
+                try:
+                    if abs(new_reading - float(self.last_reading)) > 0.5:
+                        return True
+                except:
+                    return True
+            elif self.room_type == "gas" and isinstance(new_reading, int):
+                try:
+                    if abs(new_reading - int(self.last_reading)) > 50:
+                        return True
+                except:
+                    return True
+            elif self.room_type == "flame":
+                return new_status != self.last_status
+            
+            if current_time - self.last_sent_time >= 1.5:
+                return True
+        
+        return False
+    
+    def update(self, new_status, new_reading):
+        self.last_status = self.status
+        self.last_reading = self.reading
+        self.status = new_status
+        self.reading = new_reading
+        self.last_sent_time = time.time()
+
+rooms = {
+    "ROOM1": RoomState("temp"),
+    "ROOM2": RoomState("gas"),
+    "ROOM3": RoomState("flame")
 }
 
-# ======== Helper Functions ========
-def send_to_laravel(room, status):
-    """Send room status to Laravel API"""
-    try:
-        print(f"📤 Sending: {room} -> {status}")
-        response = requests.post(
-            config["api_url"],
-            json={"room": room, "status": status},
-            timeout=3
-        )
+# ======== Queue System ========
+update_queue = []
+queue_lock = threading.Lock()
+last_send_time = 0
+
+def send_updates():
+    global last_send_time
+    
+    current_time = time.time()
+    
+    if current_time - last_send_time < 0.2:
+        return
+    
+    with queue_lock:
+        if not update_queue:
+            return
         
-        if response.status_code == 200:
-            print(f"✅ Success: {room} updated to {status}")
-            return True
-        else:
-            print(f"❌ Failed: HTTP {response.status_code} - {response.text}")
-            return False
-            
-    except requests.exceptions.ConnectionError:
-        print("❌ Cannot connect to Laravel. Is the server running?")
-        print("   Run: php artisan serve")
-        return False
-    except requests.exceptions.Timeout:
-        print("❌ Request timeout")
-        return False
-    except Exception as e:
-        print(f"❌ Unexpected error: {e}")
-        return False
-
-def parse_arduino_data(line):
-    """Parse Arduino serial data"""
-    data = {
-        'temp': None,
-        'gas': None,
-        'flame': None,
-        'alarm': None
-    }
+        updates_to_send = update_queue.copy()
+        update_queue.clear()
     
-    # Parse temperature (e.g., "Temp: 25.5 °C")
-    temp_match = re.search(r"Temp:\s*([0-9]+(?:\.[0-9]+)?)", line, re.IGNORECASE)
-    if temp_match:
+    for update in updates_to_send:
         try:
-            data['temp'] = float(temp_match.group(1))
-        except ValueError:
+            response = requests.post(
+                API_URL,
+                json={
+                    "room": update['room'],
+                    "status": update['status'],
+                    "reading": update['reading']
+                },
+                timeout=0.5
+            )
+        except Exception as e:
             pass
     
-    # Parse gas (e.g., "Gas: 850")
-    gas_match = re.search(r"Gas:\s*(\d+)", line, re.IGNORECASE)
-    if gas_match:
-        try:
-            data['gas'] = int(gas_match.group(1))
-        except ValueError:
-            pass
-    
-    # Parse flame status (e.g., "Flame: SAFE" or "Flame: DETECTED")
-    flame_match = re.search(r"Flame:\s*(DETECTED|SAFE)", line, re.IGNORECASE)
-    if flame_match:
-        data['flame'] = flame_match.group(1).upper()
-    
-    # Parse overall alarm status (e.g., "→ SAFE" or "→ ALARM!")
-    alarm_match = re.search(r"→\s*(SAFE|ALARM!)", line)
-    if alarm_match:
-        data['alarm'] = alarm_match.group(1)
-    
-    return data
+    last_send_time = current_time
 
-def update_room_status(room, new_status):
-    """Update room status if changed"""
-    if last_states.get(room) != new_status:
-        if send_to_laravel(room, new_status):
-            last_states[room] = new_status
-            return True
-    return False
+def queue_update(room, status, reading):
+    with queue_lock:
+        update_queue.append({
+            "room": room,
+            "status": status,
+            "reading": reading,
+            "timestamp": time.time()
+        })
 
-print("\n🔄 Listening for Arduino data...")
-print("Press Ctrl+C to stop")
+def parse_line(line):
+    parts = line.strip().split(",")
+    if len(parts) != 4:
+        return None
+    try:
+        temp = float(parts[0])
+        gas = int(parts[1])
+        flame = parts[2].strip().upper()
+        alarm = parts[3].strip().upper()
+        return temp, gas, flame, alarm
+    except (ValueError, IndexError):
+        return None
+
+def determine_status(value, current_status, high, low):
+    if value > high:
+        return "FIRE"
+    elif value < low:
+        return "SAFE"
+    else:
+        return current_status
+
+# ======== Main Loop ========
+print("\nListening for Arduino data...")
+print("Press Ctrl+C to stop\n")
 print("-" * 60)
 
 try:
+    last_print_time = time.time()
+    last_data_time = time.time()
+    line_count = 0
+    
     while True:
-        if arduino.in_waiting:
+        if arduino.in_waiting > 0:
             try:
-                # Read line from Arduino
-                line = arduino.readline().decode('utf-8', errors='ignore').strip()
+                raw = arduino.readline()
                 
-                if not line:
-                    continue
+                try:
+                    raw_str = raw.decode("utf-8", errors="ignore").strip()
+                except:
+                    raw_str = ""
                 
-                print(f"\n📨 Arduino: {line}")
-                
-                # Parse the data
-                data = parse_arduino_data(line)
-                
-                # Process Room 1 (Temperature)
-                if data['temp'] is not None:
-                    temp = data['temp']
-                    print(f"🌡️  Temperature: {temp}°C")
+                if raw_str:
+                    line_count += 1
                     
-                    # Apply Arduino's hysteresis logic
-                    if temp > 50.0:  # tempHigh
-                        update_room_status("ROOM1", "FIRE")
-                    elif temp < 45.0:  # tempLow
-                        update_room_status("ROOM1", "SAFE")
-                    # If between 45-50°C, keep previous state
-                
-                # Process Room 2 (Gas)
-                if data['gas'] is not None:
-                    gas = data['gas']
-                    print(f"💨 Gas Level: {gas} PPM")
+                    if line_count <= 10 or line_count % 50 == 0:
+                        print(f"[{line_count}] Received: {raw_str}")
                     
-                    # Apply Arduino's hysteresis logic
-                    if gas > 1100:  # gasHigh
-                        update_room_status("ROOM2", "FIRE")
-                    elif gas < 1000:  # gasLow
-                        update_room_status("ROOM2", "SAFE")
-                    # If between 1000-1100 PPM, keep previous state
-                
-                # Process Room 3 (Flame)
-                if data['flame'] is not None:
-                    flame_status = data['flame']
-                    print(f"🔥 Flame Status: {flame_status}")
+                    last_data_time = time.time()
                     
-                    new_status = "FIRE" if flame_status == "DETECTED" else "SAFE"
-                    update_room_status("ROOM3", new_status)
+                    parsed = parse_line(raw_str)
+                    if parsed is None:
+                        if line_count <= 5:
+                            print(f"  Parse failed - expected format: temp,gas,flame,alarm")
+                        continue
+                    
+                    temp, gas, flame, alarm = parsed
+                    
+                    if line_count <= 10 or line_count % 50 == 0:
+                        print(f"  Parsed: Temp={temp}C, Gas={gas}, Flame={flame}")
+                    
+                    temp_status = determine_status(
+                        temp, rooms["ROOM1"].status, TEMP_HIGH, TEMP_LOW
+                    )
+                    if rooms["ROOM1"].should_send(temp_status, round(temp, 1)):
+                        queue_update("ROOM1", temp_status, round(temp, 1))
+                        rooms["ROOM1"].update(temp_status, round(temp, 1))
+                    
+                    gas_status = determine_status(
+                        gas, rooms["ROOM2"].status, GAS_HIGH, GAS_LOW
+                    )
+                    if rooms["ROOM2"].should_send(gas_status, gas):
+                        queue_update("ROOM2", gas_status, gas)
+                        rooms["ROOM2"].update(gas_status, gas)
+                    
+                    flame_status = "FIRE" if flame == "DETECTED" else "SAFE"
+                    if rooms["ROOM3"].should_send(flame_status, flame):
+                        queue_update("ROOM3", flame_status, flame)
+                        rooms["ROOM3"].update(flame_status, flame)
+                    
+                    current_time = time.time()
+                    if current_time - last_print_time >= 5:
+                        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Summary:")
+                        print(f"  Temp: {temp}C | Gas: {gas} | Flame: {flame}")
+                        for room_name, room in rooms.items():
+                            status_text = "[FIRE]" if room.status == "FIRE" else "[SAFE]"
+                            print(f"    {status_text} {room_name}: {room.status} | {room.reading}")
+                        print("-" * 40)
+                        last_print_time = current_time
                 
-                # If Arduino says ALARM! but we missed it, force FIRE status
-                if data['alarm'] == "ALARM!":
-                    print("🚨 Arduino reports ALARM!")
-                    # Check if any room should be FIRE but isn't
-                    for room in ["ROOM1", "ROOM2", "ROOM3"]:
-                        if last_states.get(room) != "FIRE":
-                            # If temperature, gas, or flame suggest FIRE but we missed it
-                            if (room == "ROOM1" and data['temp'] and data['temp'] > 50.0) or \
-                               (room == "ROOM2" and data['gas'] and data['gas'] > 1100) or \
-                               (room == "ROOM3" and data['flame'] == "DETECTED"):
-                                update_room_status(room, "FIRE")
-                
-                # Print current status
-                print("\n📊 Current Status:")
-                for room in ["ROOM1", "ROOM2", "ROOM3"]:
-                    status = last_states.get(room, "UNKNOWN")
-                    icon = "🔥" if status == "FIRE" else "✅" if status == "SAFE" else "❓"
-                    print(f"  {icon} {room}: {status}")
-                
-                print("-" * 40)
-                
-            except UnicodeDecodeError:
-                print("⚠️  Could not decode Arduino data")
             except Exception as e:
-                print(f"⚠️  Error processing data: {e}")
+                print(f"Error: {e}")
         
-        time.sleep(0.1)  # Small delay to prevent CPU overuse
+        send_updates()
+        
+        current_time = time.time()
+        if current_time - last_data_time > 5:
+            print(f"Warning: No data from Arduino for {int(current_time - last_data_time)} seconds")
+        
+        time.sleep(0.05)
 
 except KeyboardInterrupt:
-    print("\n\n" + "=" * 60)
-    print("🛑 Shutting down...")
-    
-    # Send SAFE status to all rooms before exiting
-    print("📤 Setting all rooms to SAFE before exit...")
-    for room in ["ROOM1", "ROOM2", "ROOM3"]:
-        send_to_laravel(room, "SAFE")
-    
-    # Close serial connection
-    try:
-        arduino.close()
-        print("✅ Serial connection closed")
-    except:
-        print("⚠️  Could not close serial connection")
-    
-    print("\n👋 Bridge stopped successfully")
+    print("\n" + "=" * 60)
+    print("Shutting down...")
+    for room_name, room in rooms.items():
+        try:
+            requests.post(
+                API_URL,
+                json={"room": room_name, "status": "SAFE", "reading": "--"},
+                timeout=1
+            )
+        except:
+            pass
+    arduino.close()
+    print("Bridge stopped")
     print("=" * 60)
 
 except Exception as e:
-    print(f"\n❌ Fatal error: {e}")
+    print(f"\nFATAL ERROR: {e}")
+    import traceback
+    traceback.print_exc()
     try:
         arduino.close()
     except:
         pass
-    print("❌ Bridge crashed")
